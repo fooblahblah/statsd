@@ -1,18 +1,63 @@
 var dgram  = require('dgram')
-  , sys    = require('sys')
+  , util    = require('util')
   , net    = require('net')
   , config = require('./config')
+  , fs     = require('fs')
+  , events = require('events')
 
+var keyCounter = {};
 var counters = {};
 var timers = {};
-var debugInt, flushInt, server, mgmtServer;
+var gauges = {};
+var pctThreshold = null;
+var debugInt, flushInterval, keyFlushInt, server, mgmtServer;
 var startup_time = Math.round(new Date().getTime() / 1000);
+var backendEvents = new events.EventEmitter();
+
+// Load and init the backend from the backends/ directory.
+function loadBackend(config, name) {
+  var backendmod = require("./backends/" + name);
+
+  if (config.debug) {
+    util.log("Loading backend: " + name);
+  }
+
+  var ret = backendmod.init(startup_time, config, backendEvents);
+  if (!ret) {
+    util.log("Failed to load backend: " + name);
+    process.exit(1);
+  }
+};
+
+// Flush metrics to each backend.
+function flushMetrics() {
+  var time_stamp = Math.round(new Date().getTime() / 1000);
+
+  var metrics_hash = {
+    counters: counters,
+    gauges: gauges,
+    timers: timers,
+    pctThreshold: pctThreshold
+  }
+
+  // After all listeners, reset the stats
+  backendEvents.once('flush', function clear_metrics(ts, metrics) {
+    // Clear the counters
+    for (key in metrics.counters) {
+      metrics.counters[key] = 0;
+    }
+
+    // Clear the timers
+    for (key in metrics.timers) {
+      metrics.timers[key] = [];
+    }
+  });
+
+  // Flush metrics to each backend.
+  backendEvents.emit('flush', time_stamp, metrics_hash);
+};
 
 var stats = {
-  graphite: {
-    last_flush: startup_time,
-    last_exception: startup_time
-  },
   messages: {
     last_msg_seen: startup_time,
     bad_lines_seen: 0,
@@ -21,25 +66,38 @@ var stats = {
 
 config.configFile(process.argv[2], function (config, oldConfig) {
   if (! config.debug && debugInt) {
-    clearInterval(debugInt); 
+    clearInterval(debugInt);
     debugInt = false;
   }
 
   if (config.debug) {
     if (debugInt !== undefined) { clearInterval(debugInt); }
-    debugInt = setInterval(function () { 
-      sys.log("Counters:\n" + sys.inspect(counters) + "\nTimers:\n" + sys.inspect(timers));
+    debugInt = setInterval(function () {
+      util.log("Counters:\n" + util.inspect(counters) +
+               "\nTimers:\n" + util.inspect(timers) +
+               "\nGauges:\n" + util.inspect(gauges));
     }, config.debugInterval || 10000);
   }
 
   if (server === undefined) {
+
+    // key counting
+    var keyFlushInterval = Number((config.keyFlush && config.keyFlush.interval) || 0);
+
     server = dgram.createSocket('udp4', function (msg, rinfo) {
-      if (config.dumpMessages) { sys.log(msg.toString()); }
+      if (config.dumpMessages) { util.log(msg.toString()); }
       var bits = msg.toString().split(':');
       var key = bits.shift()
                     .replace(/\s+/g, '_')
                     .replace(/\//g, '-')
                     .replace(/[^a-zA-Z_\-0-9\.]/g, '');
+
+      if (keyFlushInterval > 0) {
+        if (! keyCounter[key]) {
+          keyCounter[key] = 0;
+        }
+        keyCounter[key] += 1;
+      }
 
       if (bits.length == 0) {
         bits.push("1");
@@ -49,7 +107,7 @@ config.configFile(process.argv[2], function (config, oldConfig) {
         var sampleRate = 1;
         var fields = bits[i].split("|");
         if (fields[1] === undefined) {
-            sys.log('Bad line: ' + fields);
+            util.log('Bad line: ' + fields);
             stats['messages']['bad_lines_seen']++;
             continue;
         }
@@ -58,6 +116,8 @@ config.configFile(process.argv[2], function (config, oldConfig) {
             timers[key] = [];
           }
           timers[key].push(Number(fields[0] || 0));
+        } else if (fields[1].trim() == "g") {
+          gauges[key] = Number(fields[0] || 0);
         } else {
           if (fields[2] && fields[2].match(/^@([\d\.]+)/)) {
             sampleRate = Number(fields[2].match(/^@([\d\.]+)/)[1]);
@@ -76,11 +136,12 @@ config.configFile(process.argv[2], function (config, oldConfig) {
       stream.setEncoding('ascii');
 
       stream.on('data', function(data) {
-        var cmd = data.trim();
+        var cmdline = data.trim().split(" ");
+        var cmd = cmdline.shift();
 
         switch(cmd) {
           case "help":
-            stream.write("Commands: stats, counters, timers, quit\n\n");
+            stream.write("Commands: stats, counters, timers, gauges, delcounters, deltimers, delgauges, quit\n\n");
             break;
 
           case "stats":
@@ -89,30 +150,78 @@ config.configFile(process.argv[2], function (config, oldConfig) {
 
             stream.write("uptime: " + uptime + "\n");
 
+            var stat_writer = function(group, metric, val) {
+              var delta;
+
+              if (metric.match("^last_")) {
+                delta = now - val;
+              }
+              else {
+                delta = val;
+              }
+
+              stream.write(group + "." + metric + ": " + delta + "\n");
+            };
+
+            // Loop through the base stats
             for (group in stats) {
               for (metric in stats[group]) {
-                var val;
-
-                if (metric.match("^last_")) {
-                  val = now - stats[group][metric];
-                }
-                else {
-                  val = stats[group][metric];
-                }
-
-                stream.write(group + "." + metric + ": " + val + "\n");
+                stat_writer(group, metric, stats[group][metric]);
               }
             }
-            stream.write("END\n\n");
+
+            backendEvents.once('status', function(writeCb) {
+              stream.write("END\n\n");
+            });
+
+            // Let each backend contribute its status
+            backendEvents.emit('status', function(err, name, stat, val) {
+              if (err) {
+                util.log("Failed to read stats for backend " +
+                         name + ": " + err);
+              } else {
+                stat_writer(name, stat, val);
+              }
+            });
+
             break;
 
           case "counters":
-            stream.write(sys.inspect(counters) + "\n");
+            stream.write(util.inspect(counters) + "\n");
             stream.write("END\n\n");
             break;
 
           case "timers":
-            stream.write(sys.inspect(timers) + "\n");
+            stream.write(util.inspect(timers) + "\n");
+            stream.write("END\n\n");
+            break;
+
+          case "gauges":
+            stream.write(util.inspect(gauges) + "\n");
+            stream.write("END\n\n");
+            break;
+
+          case "delcounters":
+            for (index in cmdline) {
+              delete counters[cmdline[index]];
+              stream.write("deleted: " + cmdline[index] + "\n");
+            }
+            stream.write("END\n\n");
+            break;
+
+          case "deltimers":
+            for (index in cmdline) {
+              delete timers[cmdline[index]];
+              stream.write("deleted: " + cmdline[index] + "\n");
+            }
+            stream.write("END\n\n");
+            break;
+
+          case "delgauges":
+            for (index in cmdline) {
+              delete gauges[cmdline[index]];
+              stream.write("deleted: " + cmdline[index] + "\n");
+            }
             stream.write("END\n\n");
             break;
 
@@ -128,94 +237,64 @@ config.configFile(process.argv[2], function (config, oldConfig) {
       });
     });
 
-    server.bind(config.port || 8125);
-    mgmtServer.listen(config.mgmt_port || 8126);
+    server.bind(config.port || 8125, config.address || undefined);
+    mgmtServer.listen(config.mgmt_port || 8126, config.mgmt_address || undefined);
 
-    sys.log("server is up");
+    util.log("server is up");
 
-    var flushInterval = Number(config.flushInterval || 10000);
+    pctThreshold = config.percentThreshold || 90;
+    if (!Array.isArray(pctThreshold)) {
+      pctThreshold = [ pctThreshold ]; // listify percentiles so single values work the same
+    }
 
-    flushInt = setInterval(function () {
-      var statString = '';
-      var ts = Math.round(new Date().getTime() / 1000);
-      var numStats = 0;
-      var key;
+    flushInterval = Number(config.flushInterval || 10000);
+    config.flushInterval = flushInterval;
 
-      for (key in counters) {
-        var value = counters[key] / (flushInterval / 1000);
-        var message = 'stats.' + key + ' ' + value + ' ' + ts + "\n";
-        message += 'stats_counts.' + key + ' ' + counters[key] + ' ' + ts + "\n";
-        statString += message;
-        delete(counters[key]);
-
-        numStats += 1;
+    if (config.backends) {
+      for (var i = 0; i < config.backends.length; i++) {
+        loadBackend(config, config.backends[i]);
       }
+    } else {
+      // The default backend is graphite
+      loadBackend(config, 'graphite');
+    }
 
-      for (key in timers) {
-        if (timers[key].length > 0) {
-          var pctThreshold = config.percentThreshold || 90;
-          var values = timers[key].sort(function (a,b) { return a-b; });
-          var count = values.length;
-          var min = values[0];
-          var max = values[count - 1];
+    // Setup the flush timer
+    var flushInt = setInterval(flushMetrics, flushInterval);
 
-          var mean = min;
-          var maxAtThreshold = max;
+    if (keyFlushInterval > 0) {
+      var keyFlushPercent = Number((config.keyFlush && config.keyFlush.percent) || 100);
+      var keyFlushLog = (config.keyFlush && config.keyFlush.log) || "stdout";
 
-          if (count > 1) {
-            var thresholdIndex = Math.round(((100 - pctThreshold) / 100) * count);
-            var numInThreshold = count - thresholdIndex;
-            values = values.slice(0, numInThreshold);
-            maxAtThreshold = values[numInThreshold - 1];
+      keyFlushInt = setInterval(function () {
+        var key;
+        var sortedKeys = [];
 
-            // average the remaining timings
-            var sum = 0;
-            for (var i = 0; i < numInThreshold; i++) {
-              sum += values[i];
-            }
-
-            mean = sum / numInThreshold;
-          }
-
-          timers[key] = [];
-
-          var message = "";
-          message += 'stats.timers.' + key + '.mean ' + mean + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.upper ' + max + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.upper_' + pctThreshold + ' ' + maxAtThreshold + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.lower ' + min + ' ' + ts + "\n";
-          message += 'stats.timers.' + key + '.count ' + count + ' ' + ts + "\n";
-          statString += message;
-
-          numStats += 1;
+        for (key in keyCounter) {
+          sortedKeys.push([key, keyCounter[key]]);
         }
-      }
 
-      statString += 'statsd.numStats ' + numStats + ' ' + ts + "\n";
-      
-      if (config.graphiteHost) {
-        try {
-          var graphite = net.createConnection(config.graphitePort, config.graphiteHost);
-          graphite.addListener('error', function(connectionException){
-            if (config.debug) {
-              sys.log(connectionException);
-            }
-          });
-          graphite.on('connect', function() {
-            this.write(statString);
-            this.end();
-            stats['graphite']['last_flush'] = Math.round(new Date().getTime() / 1000);
-          });
-        } catch(e){
-          if (config.debug) {
-            sys.log(e);
-          }
-          stats['graphite']['last_exception'] = Math.round(new Date().getTime() / 1000);
+        sortedKeys.sort(function(a, b) { return b[1] - a[1]; });
+
+        var logMessage = "";
+        var timeString = (new Date()) + "";
+
+        // only show the top "keyFlushPercent" keys
+        for (var i = 0, e = sortedKeys.length * (keyFlushPercent / 100); i < e; i++) {
+          logMessage += timeString + " " + sortedKeys[i][1] + " " + sortedKeys[i][0] + "\n";
         }
-      }
 
-    }, flushInterval);
+        var logFile = fs.createWriteStream(keyFlushLog, {flags: 'a+'});
+        logFile.write(logMessage);
+        logFile.end();
+
+        // clear the counter
+        keyCounter = {};
+      }, keyFlushInterval);
+    }
+
+
+  ;
+
   }
-
-});
-
+})
