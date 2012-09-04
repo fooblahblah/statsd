@@ -13,7 +13,7 @@ var fs           = require('fs'),
 var writeconfig = function(text,worker,cb,obj){
   temp.open({suffix: '-statsdconf.js'}, function(err, info) {
     if (err) throw err;
-    fs.write(info.fd, text);
+    fs.writeSync(info.fd, text);
     fs.close(info.fd, function(err) {
       if (err) throw err;
       worker(info.path,cb,obj);
@@ -149,7 +149,7 @@ module.exports = {
           return data;
         });
         test.ok(_.include(_.map(entries,function(x) { return _.keys(x)[0] }),'statsd.numStats'),'graphite output includes numStats');
-        test.equal(_.find(entries, function(x) { return _.keys(x)[0] == 'statsd.numStats' })['statsd.numStats'],0);
+        test.equal(_.find(entries, function(x) { return _.keys(x)[0] == 'statsd.numStats' })['statsd.numStats'],2);
         test.done();
       });
     });
@@ -172,7 +172,7 @@ module.exports = {
             });
             var numstat_test = function(post){
               var mykey = 'statsd.numStats';
-              return _.include(_.keys(post),mykey) && (post[mykey] == 1);
+              return _.include(_.keys(post),mykey) && (post[mykey] == 3);
             };
             test.ok(_.any(hashes,numstat_test), 'statsd.numStats should be 1');
 
@@ -205,7 +205,7 @@ module.exports = {
             });
             var numstat_test = function(post){
               var mykey = 'statsd.numStats';
-              return _.include(_.keys(post),mykey) && (post[mykey] == 1);
+              return _.include(_.keys(post),mykey) && (post[mykey] == 3);
             };
             test.ok(_.any(hashes,numstat_test), 'statsd.numStats should be 1');
 
